@@ -2,98 +2,96 @@ name: Build & Deploy to ECS
 
 on:
   push:
-    branches: [ "master" ]
-
+    branches: [ "main" ]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Setup Java
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
 
-    - name: Build JAR
-      run: mvn clean package -DskipTests
+      - name: Build JAR
+        run: mvn clean package -DskipTests
 
-    - name: Configure AWS
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: us-east-1
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
 
-    - name: Build & Push Docker Image
-      id: build-image
-      run: |
-        # Use variables to prevent typos
-        REGISTRY=336449586386.dkr.ecr.us-east-1.amazonaws.com
-        REPOSITORY=health-api
-        IMAGE_TAG=${{ github.sha }}
-        FULL_IMAGE_URI=$REGISTRY/$REPOSITORY:$IMAGE_TAG
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-        # Build with the FULL ECR URI to prevent Docker from defaulting to Docker Hub
-        docker build -t $FULL_IMAGE_URI .
-        
-        # Tag it as latest as well
-        docker tag $FULL_IMAGE_URI $REGISTRY/$REPOSITORY:latest
-        
-        # Push both tags to ECR
-        docker push $FULL_IMAGE_URI
-        docker push $REGISTRY/$REPOSITORY:latest
-        
-        echo "image=$FULL_IMAGE_URI" >> $GITHUB_OUTPUT
+      - name: Build & Push Docker Image
+        id: build-image
+        run: |
+          REGISTRY=336449586386.dkr.ecr.us-east-1.amazonaws.com
+          REPOSITORY=health-api
+          IMAGE_TAG=${{ github.sha }}
+          FULL_IMAGE_URI=$REGISTRY/$REPOSITORY:$IMAGE_TAG
 
-    - name: Execute Deployment Script
-      run: |
+          docker build -t $FULL_IMAGE_URI .
+          docker tag $FULL_IMAGE_URI $REGISTRY/$REPOSITORY:latest
+
+          docker push $FULL_IMAGE_URI
+          docker push $REGISTRY/$REPOSITORY:latest
+
+          echo "image=$FULL_IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS
+        run: |
+          set -e
+
           REGION=us-east-1
           CLUSTER=health-api-cluster
           SERVICE_NAME=health-api-srvc
-          IMAGE_URI=${{ steps.build-image.outputs.image }}
-          
-          # 1. Update task-definition.json using jq (targets first container in array)
+          IMAGE_URI='${{ steps.build-image.outputs.image }}'
+
+          # Update image in task definition
           jq --arg IMG "$IMAGE_URI" '.containerDefinitions[0].image = $IMG' task-definition.json > final-taskdef.json
-          
-          # 2. Register the new Task Definition revision
-          NEW_TASK_INFO=$(aws ecs register-task-definition --cli-input-json file://final-taskdef.json --region ${REGION})
-          REVISION=$(echo $NEW_TASK_INFO | jq -r .taskDefinition.revision)
-          FAMILY=$(echo $NEW_TASK_INFO | jq -r .taskDefinition.family)
-          
-          # 3. Check if service exists
-          SERVICE_EXISTS=$(aws ecs describe-services --services ${SERVICE_NAME} --cluster ${CLUSTER} --region ${REGION} | jq -r '.services | length')
-          
+
+          # Register task definition
+          NEW_TASK_INFO=$(aws ecs register-task-definition --cli-input-json file://final-taskdef.json --region "$REGION")
+          REVISION=$(echo "$NEW_TASK_INFO" | jq -r .taskDefinition.revision)
+          FAMILY=$(echo "$NEW_TASK_INFO" | jq -r .taskDefinition.family)
+
+          # Check if service exists
+          SERVICE_EXISTS=$(aws ecs describe-services --services "$SERVICE_NAME" --cluster "$CLUSTER" --region "$REGION" | jq -r '.services | length')
+
           if [ "$SERVICE_EXISTS" -gt "0" ]; then
-            echo "Updating existing service to revision $REVISION..."
-            # --force-new-deployment ensures the new image is pulled on EC2
+            echo "Updating service to ${FAMILY}:${REVISION}..."
             aws ecs update-service \
-              --cluster ${CLUSTER} \
-              --service ${SERVICE_NAME} \
-              --task-definition ${FAMILY}:${REVISION} \
+              --cluster "$CLUSTER" \
+              --service "$SERVICE_NAME" \
+              --task-definition "${FAMILY}:${REVISION}" \
               --force-new-deployment \
-              --region ${REGION}
+              --region "$REGION"
           else
-            echo "Creating new EC2 service..."
-            # 4. Get Network Configuration for awsvpc mode
-            VPC_ID=$(aws ec2 describe-subnets --region ${REGION} --query 'Subnets[0].VpcId' --output text)
-            SUBNETS=$(aws ec2 describe-subnets --region ${REGION} --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[*].SubnetId' --output text | sed 's/\t/,/g')
-            SEC_GROUP=$(aws ec2 describe-security-groups --region ${REGION} --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=default" --query 'SecurityGroups[0].GroupId' --output text)
-            
+            echo "Creating service..."
+
+            VPC_ID=$(aws ec2 describe-subnets --region "$REGION" --query 'Subnets[0].VpcId' --output text)
+            SUBNETS_JSON=$(aws ec2 describe-subnets --region "$REGION" --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[*].SubnetId' --output json)
+            SEC_GROUP_JSON=$(aws ec2 describe-security-groups --region "$REGION" --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=default" --query 'SecurityGroups[*].GroupId' --output json)
+
             aws ecs create-service \
-              --service-name ${SERVICE_NAME} \
-              --cluster ${CLUSTER} \
-              --region ${REGION} \
-              --task-definition ${FAMILY}:${REVISION} \
+              --service-name "$SERVICE_NAME" \
+              --cluster "$CLUSTER" \
+              --region "$REGION" \
+              --task-definition "${FAMILY}:${REVISION}" \
               --launch-type EC2 \
               --desired-count 1 \
-              --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SEC_GROUP],assignPublicIp=DISABLED}"
+              --network-configuration "awsvpcConfiguration={subnets=${SUBNETS_JSON},securityGroups=${SEC_GROUP_JSON},assignPublicIp=DISABLED}"
           fi
